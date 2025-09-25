@@ -1,0 +1,585 @@
+/** MENU → Gestão de casos → Atualizar dados
+ *  Colunas:
+ *  A Nº do processo
+ *  B Há citação?        | C Data de citação   | D Citação (parágrafo)
+ *  E Há audiência?      | F Data de audiência
+ *  G Há contestação?    | H Data da contestação
+ *  I Há OBF?            | J OBF (parágrafo)
+ *  K Há sentença?       | L Data da sentença  | M Êxito  | N Sentença | O Anexo sentença (URL)
+ *  P Última movimentação | Q Último anexo
+ *  R Revisão (indicativo de revisão manual)  ← NOVO
+ */
+
+const TOKEN    = '70237fb2-d628-400f-9663-d74bf9003962';
+const BASE_URL = 'https://op.digesto.com.br/api/base-judicial/tribproc/';
+
+// ====== Tuning (ajuste conforme limites da API/Apps Script) ======
+const BATCH_SIZE            = 50;   // paralelismo por lote (tente 25–100)
+const BETWEEN_BATCH_SLEEPMS = 200;  // pausa curta entre lotes
+const MAX_RETRIES           = 3;    // 429/5xx com backoff exponencial
+const BACKOFF_BASE_MS       = 800;  // base do backoff
+const SCRIPT_DEADLINE_MS    = 5.5 * 60 * 1000; // encerra por segurança <6min
+
+// ========== Utils ==========
+function parseDate(str) {
+  if (!str) return null;
+  let d = new Date(str);
+  if (!isNaN(d)) return d;
+  const m = String(str).match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (m) {
+    const [, yy, mm, dd, hh, mi] = m;
+    d = new Date(`${yy}-${mm}-${dd}T${hh}:${mi}:00-03:00`);
+    if (!isNaN(d)) return d;
+  }
+  return null;
+}
+function isoDate(d)     { return d ? Utilities.formatDate(d,'GMT-3','yyyy-MM-dd') : ''; }
+function isoDateTime(d) { return d ? Utilities.formatDate(d,'GMT-3','yyyy-MM-dd HH:mm') : ''; }
+
+function stripAccents(input) {
+  const s = String(input || '');
+  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+function capCell(text, max=49000) {
+  if (text == null) return '';
+  const s = String(text);
+  return s.length > max ? (s.slice(0, max-1) + '…') : s;
+}
+function extractParagraph(text, idx) {
+  if (!text || typeof idx !== 'number' || idx < 0) return '';
+  const T = String(text);
+  let start = T.lastIndexOf('\n\n', idx);
+  if (start < 0) start = T.lastIndexOf('\r\n\r\n', idx);
+  if (start < 0) start = T.lastIndexOf('\n', idx);
+  if (start < 0) start = T.lastIndexOf('\r\n', idx);
+  if (start < 0) start = Math.max(0, idx - 800);
+  let end = T.indexOf('\n\n', idx);
+  if (end < 0) end = T.indexOf('\r\n\r\n', idx);
+  if (end < 0) end = T.indexOf('\n', idx + 1);
+  if (end < 0) end = T.indexOf('\r\n', idx + 1);
+  if (end < 0) end = Math.min(T.length, idx + 1200);
+  return T.slice(start, end).replace(/\r?\n/g, ' ').replace(/\s{2,}/g,' ').trim();
+}
+
+// ========== Anexos & Movs helpers ==========
+function movHasCode(mov, codeList) {
+  if (!mov || !Array.isArray(mov[5]) || !Array.isArray(codeList)) return false;
+  // mov[5] é lista de [grupo, subcodigo]
+  return mov[5].some(c => Array.isArray(c) && codeList.some(t => c[0]===t[0] && c[1]===t[1]));
+}
+function movGetRef(m) {
+  return (m && typeof m[4] === 'number') ? m[4] : null;
+}
+function anexFromRaw(a){
+  // [0]=anexoId, [1]=url, [2]=tipoNum?, [3]=data, [4]=texto, [5]=ts, [6]=refMov, [7]=status/tipo
+  const status = a[7] || '';
+  return {
+    id: a[0],
+    url: a[1],
+    dt:  parseDate(a[3]),
+    txt: a[4] || '',
+    norm: '',
+    ref: (typeof a[6] === 'number' ? a[6] : null),
+    status: status,
+    statusNorm: stripAccents(status)
+  };
+}
+
+// ===== Regras/Regex (focadas em MOVIMENTOS) =====
+
+// Códigos de evento (para contexto; não são o gatilho principal)
+const CITACAO_CODES = [[3,1],[30,1],[30,2],[30,3]];
+const CONT_CODES    = [[4,0],[4,2]];
+
+const SENT_EXT_CODES   = [[6,1],[6,2],[6,3],[6,4],[6,5]];
+const SENT_PROC_CODES  = [[17,1]];
+const SENT_IMPRO_CODES = [[17,2]];
+const SENT_PART_CODES  = [[17,3]];
+
+// ===== Citação/Contestação/OBF =====
+const RX_CITEVID = /\b(cite-se|cit[ao]c[aã]o|carta de cit[ao]c[aã]o|mandado.*cita[cç][aã]o|ar\s+positivo)\b/i;
+const RX_CONT_MOV = /\bcontest[aã]?[cç][aã]o|defesa\b/i;
+
+const OBF_FALSE_CODES    = [[8,1]];
+const OBF_TRUE_CODES     = [[3,3],[3,4]];
+const OBF_FALLBACK_CODES = [[0,0]];
+const RX_FALSE_MOV = /indeferid[ao].*liminar|n[ãa]o\s+concedid[ao].*liminar/i;
+const RX_TRUE_MOV  = /(conced|defer).{0,30}(liminar|tutela)|(liminar|tutela).{0,30}(conced|defer)/i;
+
+// ===== Classificação de sentença (pelo texto do documento) =====
+const RX_EXTINTO  = /\bextint[oa]|extin[cç][aã]o\b/i;
+const RX_DESIS    = /\bdesist[êe]n[ci]a\b/i;
+const RX_PARTIAL  = /\bprocedent[ea]?\s+(em\s+parte|parcial(?:mente)?)|\bparcial(?:mente)?\s+procedent[ea]?\b/i;
+const RX_IMPRO    = /\bimprocedent[ea]|improced[êe]n[ci]a\b/i;
+const RX_PROC     = /\bprocedent[ea]s?\b|\bproced[êe]n[ci]a\b/i;
+const RX_SEM_MERITO = /\bsem\s+(resolu[cç][aã]o|julgamento)\s+do?\s*m[êe]rito\b/i;
+const RX_INDEFER_INICIAL = /\bindefer(?:ida|imento).{0,40}(peti[cç][aã]o\s+inicial|inicial)\b/i;
+
+const SENT_PATTERNS = [
+  { key: 'EXT_SEM_MERITO', re: /(extint[oa].*sem.*(julgamento|resolu[cç][aã]o).*(m[êe]rito))|(\bextin[cç][aã]o\b.*\bsem\b.*\b(m[êe]rito)\b)|\bsem\s+(resolu[cç][aã]o|julgamento)\s+do?\s*m[êe]rito\b/i,
+    label: 'Sentença: Extinção (sem julgamento de mérito)' },
+  { key: 'INDEFER_INICIAL', re: RX_INDEFER_INICIAL, label: 'Sentença: Extinção (sem julgamento de mérito)' },
+  { key: 'DESISTENCIA', re: RX_DESIS, label: 'Sentença: Desistência' },
+  { key: 'IMPROCEDENTE', re: RX_IMPRO, label: 'Sentença: Improcedente' },
+  { key: 'PROC_TOTAL',  re: /\b(totalmente|integralmente)\s+procedent[ea]\b/i, label: 'Sentença: Procedente (total)' },
+  { key: 'PROC_PARCIAL',re: RX_PARTIAL, label: 'Sentença: Procedente parcialmente' },
+  { key: 'PROCEDENTE',  re: RX_PROC, label: 'Sentença: Procedente' },
+  { key: 'EXTINCAO',    re: /\bextin[cç][aã]o\b/i, label: 'Sentença: Extinção' },
+];
+
+function classifySentenceFromText(text) {
+  if (!text) return { label: '', matchIndex: -1 };
+  const norm = stripAccents(text);
+  for (const p of SENT_PATTERNS) {
+    const m = norm.search(p.re);
+    if (m >= 0) return { label: p.label, matchIndex: m };
+  }
+  if (RX_INDEFER_INICIAL.test(norm)) return { label: 'Sentença: Extinção (sem julgamento de mérito)', matchIndex: norm.search(RX_INDEFER_INICIAL) };
+  if (RX_SEM_MERITO.test(norm))      return { label: 'Sentença: Extinção (sem julgamento de mérito)', matchIndex: norm.search(RX_SEM_MERITO) };
+  if (RX_DESIS.test(norm))           return { label: 'Sentença: Desistência', matchIndex: norm.search(RX_DESIS) };
+  if (RX_IMPRO.test(norm))           return { label: 'Sentença: Improcedente', matchIndex: norm.search(RX_IMPRO) };
+  if (RX_PARTIAL.test(norm))         return { label: 'Sentença: Procedente parcialmente', matchIndex: norm.search(RX_PARTIAL) };
+  if (RX_EXTINTO.test(norm))         return { label: 'Sentença: Extinção', matchIndex: norm.search(RX_EXTINTO) };
+  if (RX_PROC.test(norm))            return { label: 'Sentença: Procedente', matchIndex: norm.search(RX_PROC) };
+  return { label: '', matchIndex: -1 };
+}
+
+// ===== Sentença: detecção (somente documentos que caracterizam sentença), com foco em CABEÇALHO =====
+
+// 1) Negativos: somente se aparecem no CABEÇALHO (primeiros ~1200 chars)
+const RX_NEG_HEAD = /\b(despach|decis[aã]o|certid[aã]o|peti[cç][aã]o|intima[cç][aã]o|publica[cç][aã]o|juntad[ao]|termo.*aud[ií]enc|ata.*aud[ií]enc|carta\s+de\s+cit|aviso\s+de\s+receb|recurso|embarg|agrav|monocrat|parecer|expedi[çc][aã]o|remessa|conclusos?)\b/i;
+// Evitar casos “Intimação/Publicação da Sentença”
+const RX_PUB_INT_HEAD_SENT = /\b(intim|publica[cç][aã]o|disponibiliza[cç][aã]o).{0,40}sentenc/i;
+
+// 2) Marcadores típicos no CABEÇALHO + dispositivo
+const RX_SENT_HEADER   = /(^|\n|\r)\s*(sentenc[ae])\b/i;
+const RX_SENT_DISP     = /\b(julgo|homologo|extingo|condeno|absolvo|declaro)\b.{0,200}\b(procedent|improcedent|parcial|extint|m[êe]rito|pedido?s?|desist[êe]n[ci]a)\b/i;
+
+// 3) Assinatura/autoria de juiz (mais robusta)
+const RX_ASSINADO   = /assinad[oa]/gi;
+const RX_JUDGE_TIT  = /\b(ju[ií]z\s*a?(?:\s+(de\s+direito|federal|titular|substitut[oa]))?|ju[ií]za(?:\s+(de\s+direito|federal|titular|substitut[oa]))?|magistrad[oa]|desembargador(?:a)?|relator(?:a)?)\b/;
+const RX_NOT_JUDGE  = /\b(oab|advogad[oa]|procurad[oa]|defensor(?:ia)?|promotor(?:a)?|servidor(?:a)?|diretor(?:a)?|secret[aá]ri[oa]|escriv[aã]o|chefe|coordenador(?:a)?|analista|estagi[aá]ri[oa]|correios|ect|pje|projudi|softplan|eproc|e-saj|sei|gov\.br)\b/;
+const RX_COURT_SIGNALS = /\b(poder judici[áa]rio|tribunal de justi[cç]a|comarca|vara|processo\s*(n[ºo\.]|no|n\.))\b/i;
+
+function getHead(text, n=1200) {
+  return stripAccents(String(text || '')).slice(0, n);
+}
+function hasSentenceHeading(head) {
+  return RX_SENT_HEADER.test(head) && !RX_PUB_INT_HEAD_SENT.test(head);
+}
+function isNonSentenceHeading(head) {
+  return RX_NEG_HEAD.test(head);
+}
+function hasJudgeSignatureWindow(normText) {
+  if (!normText) return false;
+  let m, idxs = [];
+  RX_ASSINADO.lastIndex = 0;
+  while ((m = RX_ASSINADO.exec(normText)) !== null) idxs.push(m.index);
+  for (const i of idxs) {
+    const win = normText.slice(Math.max(0, i - 240), Math.min(normText.length, i + 240));
+    if (RX_JUDGE_TIT.test(win) && !RX_NOT_JUDGE.test(win)) return true;
+  }
+  return false;
+}
+function hasJudgeAuthOrSignature(rawText) {
+  const norm = stripAccents(rawText || '');
+  if (!norm) return false;
+  // assinatura “assinado por … juiz”
+  if (hasJudgeSignatureWindow(norm)) return true;
+  // sem “assinado”: aceitar se houver título de juiz em qualquer parte + sinais de documento jurisdicional
+  if (RX_JUDGE_TIT.test(norm) && RX_COURT_SIGNALS.test(getHead(rawText, 1600))) return true;
+  return false;
+}
+function hasSentenceMarkers(rawText) {
+  const head = getHead(rawText, 1600);
+  const norm = stripAccents(rawText || '');
+  if (isNonSentenceHeading(head)) return false;         // bloquear só por CABEÇALHO negativo
+  if (hasSentenceHeading(head)) return true;            // “SENTENÇA” no cabeçalho
+  // Sem cabeçalho clássico, aceitar por dispositivo forte ou indeferimento da inicial
+  return RX_SENT_DISP.test(norm) || RX_INDEFER_INICIAL.test(norm) || RX_SEM_MERITO.test(norm);
+}
+
+// Anexo é SENTENÇA (regra principal): marcadores + autoria/assinatura de juiz
+function isSentenceAttachmentStrict(a) {
+  if (!a || !a.txt) return false;
+  const txt = a.txt;
+  if (!hasSentenceMarkers(txt)) return false;
+  if (!hasJudgeAuthOrSignature(txt)) return false;  // exige juiz (robusto)
+  return true;
+}
+
+// Movimento cujo corpo é a própria sentença (raro, mas possível)
+function isSentenceMovementStrict(m) {
+  if (!m || !m.txt) return false;
+  const head = getHead(m.txt, 1600);
+  if (isNonSentenceHeading(head)) return false;
+  if (!hasSentenceMarkers(m.txt)) return false;
+  return hasJudgeAuthOrSignature(m.txt);
+}
+
+// Fallback (quando o TEXTO do anexo está ausente/ruim):
+//  - Se status aponta “sentença” OU o cabeçalho (quando há algum texto) aponta “SENTENÇA”.
+function isSentenceAttachmentByMetadata(a) {
+  if (!a) return false;
+  const saysSent = (a.statusNorm || '').includes('sentenc');
+  if (saysSent) return true;
+  if (a.txt) {
+    const head = getHead(a.txt, 1600);
+    if (hasSentenceHeading(head)) return true;
+  }
+  return false;
+}
+
+// ===== Revisão (sem alterar a lógica de detecção) =====
+// Heurística leve para sinalizar revisão manual quando:
+//  - há indícios de sentença nos anexos/movimentos, mas não confirmamos (hasSent=false), OU
+//  - confirmamos, mas faltam dados essenciais (URL/data/classificação).
+function computeReviewNote(movs, anexos, hasSent, sentDate, sentCat, sentURL) {
+  const reasons = [];
+
+  if (!hasSent) {
+    // Indícios em anexos: status menciona "sentenc" ou o texto contém "sentenc"
+    const hintAnx = anexos.some(a => {
+      const st = a.statusNorm || '';
+      if (st.includes('sentenc')) return true;
+      const n = stripAccents(a.txt || '');
+      return /\bsentenc[ae]\b/.test(n);
+    });
+
+    // Indícios em movimentos: menções a "sentença", "julgad(o/a) ... procedente/improcedente/parcial", "extin..."
+    const hintMov = movs.some(m => {
+      const n = m.norm || stripAccents(m.txt || '');
+      if (!n) return false;
+      if (/\bsentenc[ae]\b/.test(n)) return true; // inclui "conclusos para sentença" → pede revisão
+      if (/julgad[oa].{0,60}(procedent|improcedent|parcial)/.test(n)) return true;
+      if (/extinc[aã]o|extint[oa]/.test(n)) return true;
+      return false;
+    });
+
+    if (hintAnx || hintMov) reasons.push('Indícios de sentença não confirmada');
+  } else {
+    // Sentença confirmada, mas com dados possivelmente incompletos
+    if (!sentURL)  reasons.push('Sentença sem URL');
+    if (!sentDate) reasons.push('Sentença sem data');
+    if (!sentCat)  reasons.push('Sentença sem classificação');
+  }
+
+  return reasons.length ? ('REVISAR: ' + reasons.join('; ')) : '';
+}
+
+// ====== UI ======
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Gestão de casos')
+    .addItem('Atualizar dados', 'atualizarTodosProcessos')
+    .addToUi();
+}
+
+// ====== Core: Batched/Parallel fetch ======
+function atualizarTodosProcessos() {
+  const ss   = SpreadsheetApp.getActiveSpreadsheet();
+  const sh   = ss.getActiveSheet();
+  const last = sh.getLastRow();
+  if (last < 2) return;
+
+  const startMs = Date.now();
+
+  // Ler números e dados já preenchidos (B–Q)
+  const nums   = sh.getRange(2,1,last-1,1).getValues().flat();
+  const dataBQ = sh.getRange(2,2,last-1,16).getValues();
+
+  // Deduplicar por número de processo, mantendo TODAS as linhas vazias
+  const pendingMap = new Map();
+  nums.forEach((num, i) => {
+    if (!num) return;
+    const filled = dataBQ[i].some(x => x !== '' && x != null);
+    if (filled) return;
+    const row = i + 2;
+    if (!pendingMap.has(num)) pendingMap.set(num, []);
+    pendingMap.get(num).push(row);
+  });
+
+  const jobs = Array.from(pendingMap.entries()).map(([num, rows]) => ({ num, rows }));
+  if (!jobs.length) {
+    ss.toast('Nada para atualizar (todas as linhas já preenchidas).', 'Gestão de casos', 4);
+    return;
+  }
+
+  // Processar em lotes paralelos
+  for (let off = 0; off < jobs.length; off += BATCH_SIZE) {
+    const slice = jobs.slice(off, off + BATCH_SIZE);
+    processBatch(sh, slice, 0);
+
+    Utilities.sleep(BETWEEN_BATCH_SLEEPMS);
+    if (Date.now() - startMs > SCRIPT_DEADLINE_MS) {
+      ss.toast(`Execução interrompida por tempo (processados ~${off + slice.length}/${jobs.length}). Rode novamente para continuar.`, 'Gestão de casos', 5);
+      return;
+    }
+  }
+
+  ss.toast(`Dados atualizados (${jobs.length} processos únicos).`, 'Gestão de casos', 4);
+}
+
+function processBatch(sh, batch, attempt) {
+  const reqs = batch.map(j => ({
+    url: BASE_URL + encodeURIComponent(j.num) + '?atualiza_tribunal_anexos=false',
+    method: 'get',
+    headers: { Authorization: 'Bearer ' + TOKEN },
+    muteHttpExceptions: true
+  }));
+
+  let responses;
+  try {
+    responses = UrlFetchApp.fetchAll(reqs); // paralelo
+  } catch (err) {
+    // Falha geral (rara). Fallback: tenta individualmente para isolar erro.
+    for (let i=0; i<batch.length; i++) {
+      try {
+        const r = UrlFetchApp.fetch(reqs[i].url, reqs[i]);
+        handleResponse(sh, batch[i], r, attempt);
+      } catch (e2) {
+        markRowsStatus(sh, batch[i].rows, 'HTTP error (fallback)');
+      }
+    }
+    return;
+  }
+
+  const toRetry = [];
+  for (let i=0; i<responses.length; i++) {
+    const resp = responses[i];
+    const job  = batch[i];
+    const code = resp.getResponseCode();
+
+    if (code === 200) {
+      try {
+        const d = JSON.parse(resp.getContentText()) || {};
+        const values = buildRowValuesFromCase(d); // B→R (17 colunas)
+        // Escreve em TODAS as linhas que compartilham o mesmo nº de processo
+        job.rows.forEach(row => {
+          sh.getRange(row, 2, 1, 17).setValues([values]);
+          // Formatação da coluna R (18ª coluna) se houver revisão
+          const review = values[16];
+          const cellR = sh.getRange(row, 18);
+          if (review) {
+            cellR.setFontWeight('bold').setBackground('#fbbc04'); // laranja
+          } else {
+            cellR.setFontWeight('normal').setBackground('#ffffff'); // limpa formatação
+          }
+        });
+      } catch (e) {
+        markRowsStatus(sh, job.rows, 'Parse error');
+      }
+    } else if ((code === 429 || (code >= 500 && code < 600)) && attempt < MAX_RETRIES) {
+      toRetry.push(job);
+    } else {
+      markRowsStatus(sh, job.rows, 'HTTP ' + code);
+    }
+  }
+
+  if (toRetry.length) {
+    Utilities.sleep(BACKOFF_BASE_MS * Math.pow(2, attempt)); // backoff
+    processBatch(sh, toRetry, attempt + 1);
+  }
+}
+
+function handleResponse(sh, job, resp, attempt) {
+  const code = resp.getResponseCode();
+  if (code === 200) {
+    try {
+      const d = JSON.parse(resp.getContentText()) || {};
+      const values = buildRowValuesFromCase(d); // B→R (17 colunas)
+      job.rows.forEach(row => {
+        sh.getRange(row, 2, 1, 17).setValues([values]);
+        const review = values[16];
+        const cellR = sh.getRange(row, 18);
+        if (review) {
+          cellR.setFontWeight('bold').setBackground('#fbbc04');
+        } else {
+          cellR.setFontWeight('normal').setBackground('#ffffff');
+        }
+      });
+    } catch (e) {
+      markRowsStatus(sh, job.rows, 'Parse error');
+    }
+  } else if ((code === 429 || (code >= 500 && code < 600)) && attempt < MAX_RETRIES) {
+    Utilities.sleep(BACKOFF_BASE_MS * Math.pow(2, attempt));
+    // retry individual
+    try {
+      const r2 = UrlFetchApp.fetch(BASE_URL + encodeURIComponent(job.num) + '?atualiza_tribunal_anexos=false', {
+        method: 'get', headers: { Authorization: 'Bearer ' + TOKEN }, muteHttpExceptions: true
+      });
+      handleResponse(sh, job, r2, attempt + 1);
+    } catch (e2) {
+      markRowsStatus(sh, job.rows, 'HTTP error (retry fail)');
+    }
+  } else {
+    markRowsStatus(sh, job.rows, 'HTTP ' + code);
+  }
+}
+
+function markRowsStatus(sh, rows, msg) {
+  rows.forEach(row => sh.getRange(row, 2).setValue(msg));
+}
+
+// ====== Transformação do JSON em colunas B→R (17 valores) ======
+function buildRowValuesFromCase(d) {
+  const movRaw  = d.movs       || [];
+  const anexRaw = d.anexos     || [];
+  const audRaw  = d.audiencias || [];
+
+  // Movimentos normalizados (ordenados desc por data)
+  const movs = (movRaw || [])
+    .map(m => {
+      const txt = [m[1], m[2]].filter(Boolean).join(' – ');
+      return { raw: m, dt: parseDate(m[0]), txt, norm: stripAccents(txt), ref: movGetRef(m) };
+    })
+    .filter(x => x.dt)
+    .sort((a,b) => b.dt - a.dt);
+
+  // Índice rápido: refMov -> movimento
+  const movByRef = new Map();
+  movs.forEach(m => { if (m.ref != null) movByRef.set(m.ref, m); });
+
+  // Anexos (ordenados desc)
+  const anexos = (anexRaw || [])
+    .map(anexFromRaw)
+    .filter(x => x.dt)
+    .sort((a,b) => b.dt - a.dt);
+
+  // Últimos (para exibição)
+  const ultMovTxt = movs[0] ? `${isoDateTime(movs[0].dt)} – ${movs[0].txt}` : '';
+  const ultAnxTxt = anexos[0] ? `${isoDate(anexos[0].dt)} – ${capCell((anexos[0].txt||'').slice(0,300))} – ${anexos[0].url}` : '';
+
+  // Audiência
+  const auds = (Array.isArray(audRaw) ? audRaw : [])
+    .map(a => {
+      const ds = Array.isArray(a) ? a[0] : (a.dataHora || a.data);
+      return { dt: parseDate(ds) };
+    })
+    .filter(x => x.dt)
+    .sort((a,b) => b.dt - a.dt);
+  const hasAud  = auds.length > 0;
+  const audDate = hasAud ? isoDateTime(auds[0].dt) : '';
+
+  // ===== CITAÇÃO (por MOVIMENTO)
+  let hasCit = false, citDate = '', citExtract = '';
+  const citCandidates = movs.filter(m => movHasCode(m.raw, CITACAO_CODES));
+  for (const m of citCandidates) {
+    const txt  = m.txt || '';
+    const norm = m.norm || '';
+    if (RX_CITEVID.test(txt) || norm.includes('citacao')) {
+      const idx = txt.search(RX_CITEVID) >= 0 ? txt.search(RX_CITEVID) : Math.max(0, txt.toLowerCase().indexOf('cita'));
+      hasCit    = true;
+      citDate   = isoDate(m.dt);
+      citExtract= capCell(extractParagraph(txt, idx));
+      break;
+    }
+  }
+
+  // ===== CONTESTAÇÃO (por MOVIMENTO)
+  let hasCont = false, contDate = '';
+  const contCandidates = movs.filter(m => movHasCode(m.raw, CONT_CODES) && RX_CONT_MOV.test(m.txt || ''));
+  if (contCandidates.length) {
+    hasCont  = true;
+    contDate = isoDate(contCandidates[contCandidates.length - 1].dt);
+  }
+
+  // ===== OBF (liminar/tutela)
+  let obfFalse = movRaw.some(m => {
+    const txt = [m[1],m[2]].filter(Boolean).join(' ');
+    return movHasCode(m, OBF_FALSE_CODES) || RX_FALSE_MOV.test(txt);
+  });
+  let obfTrue = false, obfExtract = '';
+  function tryOBFByMovList(rawList) {
+    for (const r of rawList) {
+      const txt = [r[1],r[2]].filter(Boolean).join(' ');
+      if (!RX_TRUE_MOV.test(txt)) continue;
+      obfTrue    = true;
+      const idx  = txt.search(RX_TRUE_MOV);
+      obfExtract = capCell(extractParagraph(txt, idx));
+      return true;
+    }
+    return false;
+  }
+  if (!obfFalse) {
+    const movTrueMain = movRaw.filter(m => movHasCode(m, OBF_TRUE_CODES));
+    const okMain = tryOBFByMovList(movTrueMain);
+    if (!okMain) {
+      const movTrueFallback = movRaw.filter(m => movHasCode(m, OBF_FALLBACK_CODES));
+      tryOBFByMovList(movTrueFallback);
+    }
+  }
+  const obfVal = obfTrue ? true : (obfFalse ? false : '');
+
+  // ===== SENTENÇA — foco no ANEXO com cabeçalho e assinatura/juiz
+  let hasSent=false, sentDate='', sentCat='', sentURL='';
+
+  // 1) Preferência: ANEXOS cujo texto passa (marcadores + juiz)
+  const strictSentAnex = anexos.filter(a => isSentenceAttachmentStrict(a));
+  if (strictSentAnex.length) {
+    const att = strictSentAnex[0]; // mais recente
+    hasSent  = true;
+    sentDate = isoDate(att.dt);
+    const cls = classifySentenceFromText(att.txt);
+    sentCat  = cls.label || sentCat;
+    sentURL  = att.url || '';
+  }
+
+  // 2) MOVIMENTOS cujo corpo é a própria sentença (raro)
+  if (!hasSent) {
+    const strictSentMovs = movs.filter(isSentenceMovementStrict);
+    if (strictSentMovs.length) {
+      const m = strictSentMovs[0];
+      hasSent  = true;
+      sentDate = isoDate(m.dt);
+      const cls = classifySentenceFromText(m.txt);
+      sentCat  = cls.label || sentCat;
+      if (m.ref != null) {
+        const att = anexos.find(a => a.ref === m.ref);
+        if (att) sentURL = att.url || '';
+      }
+    }
+  }
+
+  // 3) Fallback (texto ruim/ausente): status “sentença” OU cabeçalho “SENTENÇA” em algum texto
+  if (!hasSent) {
+    const metaCandidates = anexos
+      .filter(a => isSentenceAttachmentByMetadata(a))
+      .sort((a,b) => b.dt - a.dt);
+    if (metaCandidates.length) {
+      const att = metaCandidates[0];
+      hasSent  = true;
+      sentDate = isoDate(att.dt);
+      const cls = classifySentenceFromText(att.txt || '');
+      if (cls.label) sentCat = cls.label;
+      sentURL  = att.url || '';
+    }
+  }
+
+  // ===== Êxito (perspectiva do réu/banco)
+  const exito = hasSent && /improcedent|extin[cç][aã]o|desist[êe]n[ci]a/i.test(stripAccents(sentCat));
+
+  // ===== Revisão (indicativo) — sem alterar a lógica de detecção
+  const reviewNote = computeReviewNote(movs, anexos, hasSent, sentDate, sentCat, sentURL);
+
+  // Retorna B→R (17 colunas)
+  return [
+    hasCit,                   // B Há citação?
+    citDate,                  // C Data de citação
+    capCell(citExtract),      // D Citação (parágrafo)
+    hasAud,                   // E Há audiência?
+    audDate,                  // F Data de audiência
+    hasCont,                  // G Há contestação?
+    contDate,                 // H Data da contestação
+    obfVal,                   // I Há OBF?
+    capCell(obfExtract),      // J OBF (parágrafo)
+    hasSent,                  // K Há sentença?
+    sentDate,                 // L Data da sentença
+    exito,                    // M Êxito
+    sentCat,                  // N Sentença
+    sentURL,                  // O Anexo sentença (URL)
+    capCell(ultMovTxt, 3000), // P Última movimentação
+    capCell(ultAnxTxt, 3000), // Q Último anexo
+    reviewNote                // R Revisão (negrito + laranja quando não vazio)
+  ];
+}
